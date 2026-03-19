@@ -214,6 +214,7 @@ class DBAccess:
 
         return result
 
+
     def get_product(self, product_id: int) -> dict | None:
         """Fetch a product by its integer ID.
 
@@ -227,7 +228,14 @@ class DBAccess:
           food:        {weight_g, organic, allergens}
           home:        {dimensions, material, assembly_required}
         """
-        raise NotImplementedError("Phase 1: implement get_product")
+
+        product_doc = self._mongo_db["product_catalog"].find_one({"id": product_id})
+        if product_doc is None:
+            return None
+        # Remove MongoDB's _id field
+        product_doc.pop('_id', None)
+        return product_doc
+
 
     def search_products(
         self,
