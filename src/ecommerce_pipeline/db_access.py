@@ -229,6 +229,8 @@ class DBAccess:
           home:        {dimensions, material, assembly_required}
         """
 
+        # yoray: connection checker if the MongoDB connection is down?...
+
         product_doc = self._mongo_db["product_catalog"].find_one({"id": product_id})
         if product_doc is None:
             return None
@@ -249,7 +251,22 @@ class DBAccess:
         Both filters are ANDed together. Returns all products if both are None.
         Returns a list of product dicts (same shape as get_product).
         """
-        raise NotImplementedError("Phase 1: implement search_products")
+
+        query = {}
+        if category is not None:
+            query["category"] = category
+        if q is not None:
+            query["name"] = {"$regex": q, "$options": "i"}
+
+        try:
+            products = list(self._mongo_db["product_catalog"].find(query))
+            for product in products:
+                product.pop('_id', None)
+            return products
+        except Exception:
+            logger.exception("Failed to search products from MongoDB")
+            return []
+
 
     def save_order_snapshot(
         self,
