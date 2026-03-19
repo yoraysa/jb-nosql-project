@@ -13,6 +13,8 @@ import json
 import logging
 from itertools import combinations
 
+from sqlalchemy import select
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,7 +49,170 @@ class DBAccess:
         is saved for read access, and downstream counters and graph edges are
         updated (best-effort, does not roll back the order on failure).
         """
-        raise NotImplementedError("Phase 1: implement create_order")
+        # Basic input validation: an order must include a customer_id.
+        if customer_id is None:
+            raise ValueError("customer_id is required")
+        try:
+            customer_id = int(customer_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("customer_id must be an integer") from exc
+
+        # Basic input validation: an order must contain at least one line item.
+        if not items:
+            raise ValueError("items must not be empty")
+
+
+
+        from ecommerce_pipeline.postgres_models import Customer, Order, OrderItem, Product
+
+        # Normalize and validate request payload:
+        # - Coerce types to int
+        # - Enforce positive quantities
+        # - Aggregate quantities per product so we can validate stock once per product
+        qty_by_product_id: dict[int, int] = {}
+        for item in items:
+            product_id = int(item["product_id"])
+            quantity = int(item["quantity"])
+            if quantity <= 0:
+                raise ValueError("quantity must be greater than 0")
+            qty_by_product_id[product_id] = qty_by_product_id.get(product_id, 0) + quantity
+
+        # We only need to load/lock products referenced by the order.
+        product_ids = list(qty_by_product_id.keys())
+
+        with self._pg_session_factory() as session:
+            try:
+                with session.begin():
+                    # Transactional write path (all-or-nothing):
+                    # If anything fails inside this block, SQLAlchemy will roll back and
+                    # Postgres state (including stock quantities) will not be modified.
+
+                    # When the customer_id doesn’t exist we create a new Customer row (or upsert)
+                    customer = session.get(Customer, customer_id)
+                    if customer is None:
+                        # Create a placeholder customer so orders can be placed
+                        # for previously unseen customer IDs.
+                        customer = Customer(
+                            id=customer_id
+                        )
+                        session.add(customer)
+                        session.flush()
+
+                    # Load and lock product rows for update to prevent concurrent
+                    # overselling. This ensures the stock check and stock decrement are
+                    # consistent within this transaction.
+                    products = (
+                        session.execute(
+                            select(Product)
+                            .where(Product.id.in_(product_ids))
+                            .with_for_update()
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    product_by_id = {p.id: p for p in products}
+
+                    # Reject orders that reference unknown product IDs.
+                    missing = [pid for pid in product_ids if pid not in product_by_id]
+                    if missing:
+                        raise ValueError(f"product not found: {missing[0]}")
+
+                    # Validate stock availability for each product (using aggregated
+                    # quantities). Any insufficiency aborts the transaction.
+                    for pid, needed_qty in qty_by_product_id.items():
+                        if product_by_id[pid].stock_quantity < needed_qty:
+                            raise ValueError("Insufficient stock")
+
+                    # Build order line items and compute the total. We build three
+                    # parallel structures:
+                    # - `order_items`: ORM objects persisted to Postgres
+                    # - `items_list`: returned to the caller + MongoDB snapshot (denormalized)
+                    total_amount = 0.0
+                    order_items: list[OrderItem] = []
+                    items_list: list[dict] = []
+
+                    for item in items:
+                        pid = int(item["product_id"])
+                        qty = int(item["quantity"])
+                        product = product_by_id[pid]
+                        unit_price = float(product.price)
+                        total_amount += unit_price * qty
+
+                        order_items.append(
+                            OrderItem(
+                                product_id=pid,
+                                quantity=qty,
+                                unit_price=unit_price,
+                            )
+                        )
+                        items_list.append(
+                            {
+                                "product_id": pid,
+                                "product_name": product.name,
+                                "quantity": qty,
+                                "unit_price": unit_price,
+                            }
+                        )
+
+
+                    # Apply stock decrements (still inside the transaction and while
+                    # holding row locks).
+                    for pid, needed_qty in qty_by_product_id.items():
+                        product_by_id[pid].stock_quantity -= needed_qty
+
+                    # Persist the order header and obtain its generated primary key
+                    # for linking order items.
+                    order = Order(
+                        customer_id=customer_id,
+                        status="completed",
+                        total_amount=total_amount,
+                    )
+                    session.add(order)
+                    session.flush()  # assign order.id and defaults
+
+                    # Persist order items referencing the newly created order.
+                    for oi in order_items:
+                        oi.order_id = order.id
+                        session.add(oi)
+
+                # After commit, build an API-friendly response payload.
+                created_at = (
+                    order.created_at.isoformat()
+                    if hasattr(order.created_at, "isoformat")
+                    else str(order.created_at)
+                )
+                result = {
+                    "order_id": int(order.id),
+                    "customer_id": int(customer_id),
+                    "status": str(order.status),
+                    "total_amount": float(order.total_amount),
+                    "created_at": created_at,
+                    "items": items_list,
+                }
+            except Exception:
+                # Defensive rollback: `session.begin()` will roll back on exceptions,
+                # but we also explicitly rollback to keep session state clean.
+                session.rollback()
+                raise
+
+        # Best-effort: denormalized snapshot in MongoDB for fast reads
+        # This happens after the transactional Postgres commit and does not affect
+        # the order outcome if it fails.
+        try:
+            self._mongo_db["order_snapshots"].insert_one(
+                {
+                    "order_id": result["order_id"],
+                    "customer": {"id": customer_id},
+                    "items": items_list,
+                    "total_amount": result["total_amount"],
+                    "status": result["status"],
+                    "created_at": result["created_at"],
+                }
+            )
+        except Exception:
+            logger.exception("Failed to write order snapshot (best-effort)")
+
+        return result
 
     def get_product(self, product_id: int) -> dict | None:
         """Fetch a product by its integer ID.
