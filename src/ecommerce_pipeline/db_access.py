@@ -330,7 +330,28 @@ class DBAccess:
         Returns [{"category": str, "total_revenue": float}, ...] sorted by
         total_revenue descending.
         """
-        raise NotImplementedError("Phase 1: implement revenue_by_category")
+        from ecommerce_pipeline.postgres_models import OrderItem, Product
+        from sqlalchemy import func
+
+        with self._pg_session_factory() as session:
+            query = (
+                select(
+                    Product.category,
+                    func.sum(OrderItem.quantity * OrderItem.unit_price).label("total_revenue")
+                )
+                .join(OrderItem, Product.id == OrderItem.product_id)
+                .group_by(Product.category)
+                .order_by(func.sum(OrderItem.quantity * OrderItem.unit_price).desc())
+            )
+            
+            results = session.execute(query).all()
+            return [
+                {
+                    "category": row[0],
+                    "total_revenue": float(row[1]) if row[1] is not None else 0.0
+                }
+                for row in results
+            ]
 
 
     # ── Phase 2 ───────────────────────────────────────────────────────────────
