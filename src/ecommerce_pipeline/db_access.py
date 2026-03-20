@@ -449,7 +449,13 @@ class DBAccess:
         Maintains a bounded, ordered list of the customer's most recently
         viewed products (most recent first, capped at 10 entries).
         """
-        raise NotImplementedError("Phase 2: implement record_product_view")
+        key = f"recently_viewed:{customer_id}"
+        # Remove product if it already exists (so it doesn't duplicate)
+        self._redis.lrem(key, 1, product_id)
+        # Add product to the front of the list (most recent)
+        self._redis.lpush(key, product_id)
+        # Keep only the most recent 10 items
+        self._redis.ltrim(key, 0, 9)
 
     def get_recently_viewed(self, customer_id: int) -> list[int]:
         """Return up to 10 recently viewed product IDs for a customer.
@@ -457,7 +463,10 @@ class DBAccess:
         Returns IDs as integers, most recently viewed first.
         Returns an empty list if no views have been recorded.
         """
-        raise NotImplementedError("Phase 2: implement get_recently_viewed")
+        key = f"recently_viewed:{customer_id}"
+        views = self._redis.lrange(key, 0, -1)
+        # Convert bytes to integers
+        return [int(view) for view in views]
 
     # ── Phase 3 ───────────────────────────────────────────────────────────────
 
