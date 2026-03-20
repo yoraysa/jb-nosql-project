@@ -36,32 +36,29 @@ class DBAccess:
     def create_order(self, customer_id: int, items: list[dict]) -> dict:
         """Place an order atomically.
 
+        customer_id: int
         items: [{"product_id": int, "quantity": int}, ...]
 
         Returns a dict with order_id, customer_id, status, total_amount,
         created_at (ISO 8601 string), and a list of items including product_name
         and unit_price.
 
-        Raises ValueError if any product has insufficient stock. When that
-        happens, no data is modified in any database.
+        Raises ValueError if any product has insufficient stock or customer fields are invalid.
+        When that happens, no data is modified in any database.
 
         After the order is persisted transactionally, a denormalized snapshot
         is saved for read access, and downstream counters and graph edges are
         updated (best-effort, does not roll back the order on failure).
         """
-        # Basic input validation: an order must include a customer_id.
-        if customer_id is None:
-            raise ValueError("customer_id is required")
+        
         try:
             customer_id = int(customer_id)
         except (TypeError, ValueError) as exc:
-            raise ValueError("customer_id must be an integer") from exc
+            raise ValueError("customer id must be an integer") from exc
 
         # Basic input validation: an order must contain at least one line item.
         if not items:
             raise ValueError("items must not be empty")
-
-
 
         from ecommerce_pipeline.postgres_models import Customer, Order, OrderItem, Product
 
@@ -88,16 +85,10 @@ class DBAccess:
                     # Postgres state (including stock quantities) will not be modified.
 
                     # When the customer_id doesn’t exist we create a new Customer row (or upsert)
-                    customer = session.get(Customer, customer_id)
-                    if customer is None:
-                        # Create a placeholder customer so orders can be placed
-                        # for previously unseen customer IDs.
-                        customer = Customer(
-                            id=customer_id
-                        )
-                        session.add(customer)
-                        session.flush()
-
+                    existing_customer = session.get(Customer, customer_id)
+                    if existing_customer is None:
+                        raise ValueError(f"Customer not exists")
+                        
                     # Load and lock product rows for update to prevent concurrent
                     # overselling. This ensures the stock check and stock decrement are
                     # consistent within this transaction.
@@ -183,7 +174,7 @@ class DBAccess:
                 )
                 result = {
                     "order_id": int(order.id),
-                    "customer_id": int(customer_id),
+                    "customer_id": int(order.customer_id),
                     "status": str(order.status),
                     "total_amount": float(order.total_amount),
                     "created_at": created_at,
@@ -199,20 +190,57 @@ class DBAccess:
         # This happens after the transactional Postgres commit and does not affect
         # the order outcome if it fails.
         try:
-            self._mongo_db["order_snapshots"].insert_one(
-                {
-                    "order_id": result["order_id"],
-                    "customer": {"id": customer_id},
-                    "items": items_list,
-                    "total_amount": result["total_amount"],
-                    "status": result["status"],
-                    "created_at": result["created_at"],
-                }
+            self.save_order_snapshot(
+                result["order_id"],
+                result["customer_id"],
+                result["items"],
+                result["total_amount"],
+                result["status"],
+                result["created_at"],
             )
         except Exception:
             logger.exception("Failed to write order snapshot (best-effort)")
+            return None
 
         return result
+
+
+    def save_order_snapshot(
+        self,
+        order_id: int,
+        customer_id: int,
+        items: list[dict],
+        total_amount: float,
+        status: str,
+        created_at: str,
+        ) -> str | None:
+        """Save a denormalized order snapshot for fast read access.
+
+        customer: {"id": int, "name": str, "email": str}
+        items: [{"product_id": int, "product_name": str, "quantity": int, "unit_price": float}]
+
+        Embeds all customer and product details as they existed at the time
+        of the order, so the snapshot remains accurate even if prices or
+        names change later.
+
+        Returns a string identifier for the saved document.
+
+        Called internally by create_order after the transactional write
+        commits. Not called directly by routes.
+        """
+
+        result = self._mongo_db["order_snapshots"].insert_one(
+            {
+                "order_id": order_id,
+                "customer_id": customer_id,
+                "items": items,
+                "total_amount": total_amount,
+                "status": status,
+                "created_at": created_at,
+            }
+        )
+
+        return str(result.inserted_id)
 
 
     def get_product(self, product_id: int) -> dict | None:
@@ -243,7 +271,8 @@ class DBAccess:
         self,
         category: str | None = None,
         q: str | None = None,
-    ) -> list[dict]:
+        ) -> list[dict]:
+
         """Search the product catalog with optional filters.
 
         category: exact match on the category field
@@ -268,38 +297,24 @@ class DBAccess:
             return []
 
 
-    def save_order_snapshot(
-        self,
-        order_id: int,
-        customer: dict,
-        items: list[dict],
-        total_amount: float,
-        status: str,
-        created_at: str,
-    ) -> str:
-        """Save a denormalized order snapshot for fast read access.
-
-        customer: {"id": int, "name": str, "email": str}
-        items: [{"product_id": int, "product_name": str, "quantity": int, "unit_price": float}]
-
-        Embeds all customer and product details as they existed at the time
-        of the order, so the snapshot remains accurate even if prices or
-        names change later.
-
-        Returns a string identifier for the saved document.
-
-        Called internally by create_order after the transactional write
-        commits. Not called directly by routes.
-        """
-        raise NotImplementedError("Phase 1: implement save_order_snapshot")
-
     def get_order(self, order_id: int) -> dict | None:
         """Fetch a single order snapshot by order_id.
 
         Returns the snapshot dict (order_id, customer embed, items list,
         total_amount, status, created_at) or None if not found.
         """
-        raise NotImplementedError("Phase 1: implement get_order")
+
+        try:
+            order_doc = self._mongo_db["order_snapshots"].find_one({"order_id": order_id})
+            if order_doc is None:
+                return None
+            # Remove MongoDB's _id field
+            order_doc.pop('_id', None)
+            return order_doc
+        except Exception:
+            logger.exception("Failed to read order from MongoDB")
+            return None
+
 
     def get_order_history(self, customer_id: int) -> list[dict]:
         """Fetch all order snapshots for a customer.

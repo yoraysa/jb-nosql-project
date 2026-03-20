@@ -39,15 +39,9 @@ class OrderResponse(BaseModel):
     items: list[OrderItemResponse]
 
 
-class OrderCustomerEmbed(BaseModel):
-    id: int
-    name: str
-    email: str
-
-
 class OrderSnapshotResponse(BaseModel):
     order_id: int
-    customer: OrderCustomerEmbed
+    customer_id: int
     items: list[OrderItemResponse]
     total_amount: float
     status: str
