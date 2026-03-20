@@ -19,13 +19,14 @@ logger = logging.getLogger(__name__)
 
 
 class DBAccess:
+
     def __init__(
         self,
         pg_session_factory,   # sqlalchemy.orm.sessionmaker bound to Postgres engine
         mongo_db,             # pymongo.database.Database
         redis_client=None,    # redis.Redis | None  (None until Phase 2)
         neo4j_driver=None,    # neo4j.Driver | None (None until Phase 3)
-    ) -> None:
+        ) -> None:
         self._pg_session_factory = pg_session_factory
         self._mongo_db = mongo_db
         self._redis = redis_client
@@ -202,8 +203,16 @@ class DBAccess:
             logger.exception("Failed to write order snapshot (best-effort)")
             return None
 
-        return result
+        # Best-effort: invalidate product cache for all products in the order
+        # so that the next read fetches fresh stock quantities from Postgres.
+        try:
+            for item in items:
+                product_id = int(item["product_id"])
+                self.invalidate_product_cache(product_id)
+        except Exception:
+            logger.exception("Failed to invalidate product cache (best-effort)")
 
+        return result
 
     def save_order_snapshot(
         self,
@@ -242,7 +251,6 @@ class DBAccess:
 
         return str(result.inserted_id)
 
-
     def get_product(self, product_id: int) -> dict | None:
         """Fetch a product by its integer ID.
 
@@ -265,7 +273,6 @@ class DBAccess:
         # Remove MongoDB's _id field
         product_doc.pop('_id', None)
         return product_doc
-
 
     def search_products(
         self,
@@ -292,7 +299,6 @@ class DBAccess:
             product.pop('_id', None)
         return products
 
-
     def get_order(self, order_id: int) -> dict | None:
         """Fetch a single order snapshot by order_id.
 
@@ -306,7 +312,6 @@ class DBAccess:
         # Remove MongoDB's _id field
         order_doc.pop('_id', None)
         return order_doc
-
 
     def get_order_history(self, customer_id: int) -> list[dict]:
         """Fetch all order snapshots for a customer.
@@ -322,7 +327,6 @@ class DBAccess:
         for order_doc in order_docs:
             order_doc.pop('_id', None)
         return order_docs
-
 
     def revenue_by_category(self) -> list[dict]:
         """Compute total revenue per product category.
@@ -380,7 +384,18 @@ class DBAccess:
         Call this after updating a product's data so the next read fetches
         fresh data from the primary store. No-op if no entry exists.
         """
-        raise NotImplementedError("Phase 2: implement invalidate_product_cache")
+
+        """
+        For example, after an order is placed and stock quantities are updated,
+        we should invalidate the cache for the affected products.
+
+        This is a simple cache invalidation strategy. In a real system,
+        you might want to use a more sophisticated approach, such as write-through caching or cache expiration.
+
+        Redis delete() method is safe to call on non-existent keys, so it's automatically a no-op if the cache entry doesn't exist.
+        """
+
+        self._redis.delete(f"inventory:{product_id}")
 
     def record_product_view(self, customer_id: int, product_id: int) -> None:
         """Record that a customer viewed a product.
