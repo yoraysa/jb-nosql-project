@@ -287,33 +287,25 @@ class DBAccess:
         if q is not None:
             query["name"] = {"$regex": q, "$options": "i"}
 
-        try:
-            products = list(self._mongo_db["product_catalog"].find(query))
-            for product in products:
-                product.pop('_id', None)
-            return products
-        except Exception:
-            logger.exception("Failed to search products from MongoDB")
-            return []
+        products = list(self._mongo_db["product_catalog"].find(query))
+        for product in products:
+            product.pop('_id', None)
+        return products
 
 
     def get_order(self, order_id: int) -> dict | None:
         """Fetch a single order snapshot by order_id.
 
-        Returns the snapshot dict (order_id, customer embed, items list,
+        Returns the snapshot dict (order_id, customer_id, items list,
         total_amount, status, created_at) or None if not found.
         """
 
-        try:
-            order_doc = self._mongo_db["order_snapshots"].find_one({"order_id": order_id})
-            if order_doc is None:
-                return None
-            # Remove MongoDB's _id field
-            order_doc.pop('_id', None)
-            return order_doc
-        except Exception:
-            logger.exception("Failed to read order from MongoDB")
+        order_doc = self._mongo_db["order_snapshots"].find_one({"order_id": order_id})
+        if order_doc is None:
             return None
+        # Remove MongoDB's _id field
+        order_doc.pop('_id', None)
+        return order_doc
 
 
     def get_order_history(self, customer_id: int) -> list[dict]:
@@ -322,7 +314,15 @@ class DBAccess:
         Returns a list of snapshot dicts sorted by created_at descending.
         Returns an empty list if the customer has no orders.
         """
-        raise NotImplementedError("Phase 1: implement get_order_history")
+        order_docs = list(
+            self._mongo_db["order_snapshots"]
+            .find({"customer_id": customer_id})
+            .sort("created_at", -1)
+        )
+        for order_doc in order_docs:
+            order_doc.pop('_id', None)
+        return order_docs
+
 
     def revenue_by_category(self) -> list[dict]:
         """Compute total revenue per product category.
@@ -331,6 +331,7 @@ class DBAccess:
         total_revenue descending.
         """
         raise NotImplementedError("Phase 1: implement revenue_by_category")
+
 
     # ── Phase 2 ───────────────────────────────────────────────────────────────
 
