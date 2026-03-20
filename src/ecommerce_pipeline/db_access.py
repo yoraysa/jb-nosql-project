@@ -362,7 +362,17 @@ class DBAccess:
         For each product, write its current stock_quantity to the counter
         store. Called at startup and after seeding products.
         """
-        raise NotImplementedError("Phase 2: implement init_inventory_counters")
+
+        from ecommerce_pipeline.postgres_models import Product
+
+        with self._pg_session_factory() as session:
+            # Query all products from Postgres
+            query = select(Product)
+            products = session.execute(query).scalars().all()
+
+            # For each product, set its stock quantity in Redis
+            for product in products:
+                self._redis.set(f"inventory:{product.id}", product.stock_quantity)
 
     def invalidate_product_cache(self, product_id: int) -> None:
         """Remove a product's cached entry.
