@@ -265,14 +265,60 @@ class DBAccess:
           home:        {dimensions, material, assembly_required}
         """
 
-        # yoray: connection checker if the MongoDB connection is down?...
+        # Cache-aside pattern: check Redis first
+        cached = self._redis.get(f"product:{product_id}")
+        if cached:
+            print("Cache hit for product", product_id)
+            return json.loads(cached)
 
-        product_doc = self._mongo_db["product_catalog"].find_one({"id": product_id})
-        if product_doc is None:
-            return None
-        # Remove MongoDB's _id field
-        product_doc.pop('_id', None)
-        return product_doc
+        # Cache miss: fetch from Postgres
+        print("Cache miss for product", product_id)
+        from ecommerce_pipeline.postgres_models import Product
+        from sqlalchemy.inspection import inspect
+
+        with self._pg_session_factory() as session:
+            product = session.get(Product, product_id)
+            if product is None:
+                return None
+
+            # Build category_fields dict dynamically based on category-specific relationships
+            category_fields = {}
+            category_model = getattr(product, product.category, None)
+
+            # Dynamically extract fields from the category model
+            if category_model:
+                mapper = inspect(category_model.__class__)
+                for column in mapper.columns:
+                    # Skip the foreign key column (product_id)
+                    if column.name != 'product_id':
+                        value = getattr(category_model, column.name)
+                        category_fields[column.name] = value
+
+            # Handle special cases for relationships (sizes, colors for clothing)
+            if product.category == "clothing" and product.clothing:
+                category_fields['sizes'] = [size.size for size in product.clothing.sizes]
+                category_fields['colors'] = [color.color for color in product.clothing.colors]
+
+            # Build the response dict matching the expected schema
+            result = {
+                "id": product.id,
+                "name": product.name,
+                "price": float(product.price),
+                "stock_quantity": product.stock_quantity,
+                "category": product.category,
+                "description": product.description or "",
+                "category_fields": category_fields,
+            }
+
+        # Populate the cache for next time
+        try:
+            self._redis.set(f"product:{product_id}", json.dumps(result, default=str))
+
+            print("Cached product", product_id)
+        except Exception:
+            logger.exception("Failed to cache product (best-effort)")
+
+        return result
 
     def search_products(
         self,
@@ -395,7 +441,7 @@ class DBAccess:
         Redis delete() method is safe to call on non-existent keys, so it's automatically a no-op if the cache entry doesn't exist.
         """
 
-        self._redis.delete(f"inventory:{product_id}")
+        self._redis.delete(f"product:{product_id}")
 
     def record_product_view(self, customer_id: int, product_id: int) -> None:
         """Record that a customer viewed a product.
