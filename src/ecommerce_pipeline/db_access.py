@@ -212,6 +212,16 @@ class DBAccess:
         except Exception:
             logger.exception("Failed to invalidate product cache (best-effort)")
 
+        # Best-effort: update the co-purchase recommendation graph in Neo4j
+        # with the products from this new order.
+        try:
+            product_ids = [int(item["product_id"]) for item in items]
+            self.seed_recommendation_graph(
+                [{"order_id": int(order.id), "product_ids": product_ids}]
+            )
+        except Exception:
+            logger.exception("Failed to update recommendation graph (best-effort)")
+
         return result
 
     def save_order_snapshot(
@@ -481,7 +491,31 @@ class DBAccess:
 
         Products not found in the catalog are silently skipped.
         """
-        raise NotImplementedError("Phase 3: implement seed_recommendation_graph")
+        if not self._neo4j:
+            logger.warning("Neo4j driver not available; skipping recommendation graph update")
+            return
+
+        for order in orders:
+            product_ids = order.get("product_ids", [])
+            if len(product_ids) < 2:
+                # Need at least 2 products to create a pair
+                continue
+
+            # Generate all unique pairs of products in this order
+            pairs = list(combinations(product_ids, 2))
+
+            # Create or update BOUGHT_TOGETHER relationships for each pair
+            with self._neo4j.session() as session:
+                for product_id_1, product_id_2 in pairs:
+                    # Cypher query to merge nodes and create/increment relationship
+                    query = """
+                    MERGE (p1:Product {id: $pid1})
+                    MERGE (p2:Product {id: $pid2})
+                    MERGE (p1)-[r:BOUGHT_TOGETHER]-(p2)
+                    ON CREATE SET r.weight = 1
+                    ON MATCH  SET r.weight = r.weight + 1
+                    """
+                    session.run(query, pid1=product_id_1, pid2=product_id_2)
 
     def get_recommendations(self, product_id: int, limit: int = 5) -> list[dict]:
         """Return product recommendations based on co-purchase patterns.
@@ -491,4 +525,36 @@ class DBAccess:
 
         Returns an empty list if the product has no co-purchase relationships.
         """
-        raise NotImplementedError("Phase 3: implement get_recommendations")
+        if not self._neo4j:
+            logger.warning("Neo4j driver not available; returning empty recommendations")
+            return []
+
+        recommendations = []
+
+        with self._neo4j.session() as session:
+            # Query for all products connected via BOUGHT_TOGETHER relationships,
+            # sorted by weight descending, limited to the requested count
+            query = """
+            MATCH (p1:Product {id: $product_id})-[r:BOUGHT_TOGETHER]-(p2:Product)
+            RETURN p2.id as product_id, r.weight as score
+            ORDER BY score DESC
+            LIMIT $limit
+            """
+            result = session.run(query, product_id=product_id, limit=limit)
+            rows = result.data()
+
+            # Fetch product details from Postgres for each recommendation
+            for row in rows:
+                recommended_product_id = row.get("product_id")
+                score = row.get("score", 0)
+
+                # Fetch product name from Postgres
+                product = self.get_product(recommended_product_id)
+                if product:
+                    recommendations.append({
+                        "product_id": recommended_product_id,
+                        "name": product.get("name", ""),
+                        "score": int(score) if score else 0,
+                    })
+
+        return recommendations
