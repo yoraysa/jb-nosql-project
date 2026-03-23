@@ -11,16 +11,7 @@ Documentation:
     https://docs.sqlalchemy.org/en/20/orm/declarative_tables.html
 """
 
-from sqlalchemy import (
-    CheckConstraint,
-    DateTime,
-    ForeignKey,
-    Index,
-    Integer,
-    Numeric,
-    String,
-    Text,
-)
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -59,6 +50,16 @@ class Product(Base):
         uselist=False,
     )
     book: Mapped["ProductBooks | None"] = relationship(
+        back_populates="product",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+    food: Mapped["ProductFood | None"] = relationship(
+        back_populates="product",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+    home: Mapped["ProductHome | None"] = relationship(
         back_populates="product",
         cascade="all, delete-orphan",
         uselist=False,
@@ -214,3 +215,32 @@ class ProductBooks(Base):
 
     product: Mapped[Product] = relationship(back_populates="book")
 
+
+class ProductFood(Base):
+    __tablename__ = "product_food"
+
+    product_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("products.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    weight_g: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    organic: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Boolean stored as 0/1
+    allergens: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # Array stored as JSON
+
+    product: Mapped[Product] = relationship(back_populates="food")
+
+
+class ProductHome(Base):
+    __tablename__ = "product_home"
+
+    product_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("products.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    dimensions: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # {width, height, depth}
+    material: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    assembly_required: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Boolean stored as 0/1
+
+    product: Mapped[Product] = relationship(back_populates="home")

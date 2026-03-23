@@ -7,9 +7,10 @@ Start the server:
 Open API docs at: http://localhost:8000/docs
 """
 
+import warnings
+
 from fastapi import FastAPI
 
-from ecommerce_pipeline.db import create_tables, get_db_access
 from ecommerce_pipeline.api.routes import products, orders, customers, analytics
 
 app = FastAPI(
@@ -29,12 +30,17 @@ app.include_router(analytics.router, prefix="/analytics", tags=["analytics"])
 
 @app.on_event("startup")
 def startup() -> None:
-    """Create Postgres tables and initialize inventory counters on startup."""
-    create_tables()
-    
-    # Initialize Redis inventory counters from Postgres stock quantities (Phase 2)
-    db = get_db_access()
-    db.init_inventory_counters()
+    """Warn if no database tables exist (student forgot to run migrate)."""
+    from ecommerce_pipeline.db import _pg_engine
+    from sqlalchemy import inspect
+
+    inspector = inspect(_pg_engine)
+    if not inspector.get_table_names():
+        warnings.warn(
+            "No database tables found. "
+            "Run 'uv run python -m scripts.migrate' before starting the API.",
+            stacklevel=1,
+        )
 
 
 @app.get("/health", tags=["health"])

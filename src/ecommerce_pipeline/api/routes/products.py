@@ -51,4 +51,4 @@ def get_product(
         raise HTTPException(status_code=501, detail={"message": str(exc)})
     if product is None:
         raise HTTPException(status_code=404, detail={"message": "product not found"})
-    return ProductResponse(**product)
+    return product

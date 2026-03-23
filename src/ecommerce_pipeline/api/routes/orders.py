@@ -17,13 +17,13 @@ def create_order(
     try:
         order = db.create_order(
             customer_id=body.customer_id,
-            items=[item.model_dump() for item in body.items],
+            items=body.items,
         )
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail={"message": str(exc)})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"message": str(exc)})
-    return OrderResponse(**order)
+    return order
 
 
 @router.get("/{order_id}", response_model=OrderSnapshotResponse)
@@ -38,4 +38,4 @@ def get_order(
         raise HTTPException(status_code=501, detail={"message": str(exc)})
     if order is None:
         raise HTTPException(status_code=404, detail={"message": "order not found"})
-    return OrderSnapshotResponse(**order)
+    return order

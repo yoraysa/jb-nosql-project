@@ -1,20 +1,20 @@
 """
-Seed script for the ecommerce-pipeline project.
-
-Loads JSON seed data into all databases:
-  Phase 1: PostgreSQL (normalized) + MongoDB (denormalized)
-  Phase 2: Redis (inventory counters)
-  Phase 3: Neo4j (recommendation graph)
+Seed script — loads data into all databases.
 
 Usage:
-    python -m scripts.seed --phase 1
-    python -m scripts.seed --phase 2
-    python -m scripts.seed --phase 3
-    python -m scripts.seed --phase all
+    uv run python -m scripts.seed
+
+Prerequisites:
+    Run scripts.migrate first to create database structures.
+
+What to implement in seed():
+    Phase 1: Load products.json + customers.json into Postgres and MongoDB
+    Phase 2: Initialize Redis inventory counters from Postgres product stock
+    Phase 3: Build Neo4j co-purchase graph from historical_orders.json
+
+Seed data files are in the seed_data/ directory.
 """
 
-import argparse
-import json
 import os
 from pathlib import Path
 
@@ -25,232 +25,255 @@ load_dotenv()
 SEED_DIR = Path(__file__).parent.parent / "seed_data"
 
 
-def load_json(filename: str) -> list[dict]:
-    path = SEED_DIR / filename
-    with open(path) as f:
-        return json.load(f)
+def seed(engine, mongo_db, redis_client=None, neo4j_driver=None):
+    """Load seed data into all databases.
 
+    Add your seeding logic here incrementally as you progress through phases.
 
-# ---------------------------------------------------------------------------
-# Phase 1: PostgreSQL + MongoDB
-# ---------------------------------------------------------------------------
+    Args:
+        engine: SQLAlchemy engine connected to Postgres
+        mongo_db: pymongo Database instance
+        redis_client: redis.Redis instance or None (Phase 2+)
+        neo4j_driver: neo4j.Driver instance or None (Phase 3)
 
-def seed_phase1() -> None:
-    from sqlalchemy import create_engine
+    Tip: Use json.load() to read the files in seed_data/:
+        products = json.load(open(SEED_DIR / "products.json"))
+        customers = json.load(open(SEED_DIR / "customers.json"))
+        historical_orders = json.load(open(SEED_DIR / "historical_orders.json"))
+    """
+    import json
+    from itertools import combinations
     from sqlalchemy.orm import sessionmaker
-    from pymongo import MongoClient, ASCENDING
-
-    # Import student-implemented models — this will raise clearly if not yet built
+    
+    # Load seed data files
+    with open(SEED_DIR / "products.json") as f:
+        products = json.load(f)
+    with open(SEED_DIR / "customers.json") as f:
+        customers = json.load(f)
+    with open(SEED_DIR / "historical_orders.json") as f:
+        historical_orders = json.load(f)
+    
+    # ── Phase 1: Load into Postgres and MongoDB ───────────────────────────
+    
     from ecommerce_pipeline.postgres_models import (
-        Base,
-        Customer,
-        Product,
-        ProductElectronics,
-        ProductClothing,
-        ClothingSize,
-        ClothingColor,
-        ProductBooks,
+        Customer, Product, ProductElectronics, ProductClothing, 
+        ProductBooks, ProductFood, ProductHome, ClothingSize, ClothingColor
     )
-
-    pg_url = _pg_url()
-    engine = create_engine(pg_url, echo=False)
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-
-    products = load_json("products.json")
-    customers = load_json("customers.json")
-
-    # ---- Postgres ----
-    with Session() as session:
-        # Customers
-        for c in customers:
-            existing = session.get(Customer, c["id"])
-            if existing is None:
-                session.add(Customer(id=c["id"], name=c["name"], email=c["email"]))
-        session.commit()
-        print(f"  Postgres: inserted {len(customers)} customers")
-
-        # Products (only electronics, clothing, books have Postgres tables)
-        pg_products = [p for p in products if p["category"] in ("electronics", "clothing", "books")]
-        inserted_products = 0
-        for p in pg_products:
-            existing = session.get(Product, p["id"])
-            if existing is not None:
-                continue
+    
+    # Create a session factory
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+    
+    try:
+        # Insert customers into Postgres
+        for customer_data in customers:
+            customer = Customer(
+                id=customer_data["id"],
+                name=customer_data["name"],
+                email=customer_data["email"],
+            )
+            session.add(customer)
+        
+        # Insert products into Postgres
+        for product_data in products:
             product = Product(
-                id=p["id"],
-                name=p["name"],
-                price=p["price"],
-                stock_quantity=p["stock_quantity"],
-                category=p["category"],
-                description=p["description"],
+                id=product_data["id"],
+                name=product_data["name"],
+                price=product_data["price"],
+                stock_quantity=product_data["stock_quantity"],
+                category=product_data["category"],
+                description=product_data.get("description"),
             )
             session.add(product)
-            session.flush()  # get the id assigned before adding category rows
-
-            cf = p["category_fields"]
-            if p["category"] == "electronics":
-                session.add(ProductElectronics(
-                    product_id=p["id"],
-                    cpu=cf.get("cpu"),
-                    ram_gb=cf.get("ram_gb"),
-                    storage_gb=cf.get("storage_gb"),
-                    screen_inches=cf.get("screen_inches"),
-                ))
-            elif p["category"] == "clothing":
-                session.add(ProductClothing(product_id=p["id"], material=cf.get("material")))
-                session.flush()
-                for size in cf.get("sizes", []):
-                    session.add(ClothingSize(clothing_id=p["id"], size=size))
-                for color in cf.get("colors", []):
-                    session.add(ClothingColor(clothing_id=p["id"], color=color))
-            elif p["category"] == "books":
-                session.add(ProductBooks(
-                    product_id=p["id"],
-                    isbn=cf.get("isbn"),
-                    author=cf.get("author"),
-                    page_count=cf.get("page_count"),
-                    genre=cf.get("genre"),
-                ))
-            inserted_products += 1
-
+            
+            # Handle category-specific fields
+            category_fields = product_data.get("category_fields", {})
+            category = product_data["category"]
+            
+            if category == "electronics":
+                electronics = ProductElectronics(
+                    product_id=product_data["id"],
+                    cpu=category_fields.get("cpu"),
+                    ram_gb=category_fields.get("ram_gb"),
+                    storage_gb=category_fields.get("storage_gb"),
+                    screen_inches=category_fields.get("screen_inches"),
+                )
+                session.add(electronics)
+            
+            elif category == "clothing":
+                clothing = ProductClothing(
+                    product_id=product_data["id"],
+                    material=category_fields.get("material"),
+                )
+                session.add(clothing)
+                
+                # Add sizes
+                for size in category_fields.get("sizes", []):
+                    clothing_size = ClothingSize(
+                        clothing_id=product_data["id"],
+                        size=size,
+                    )
+                    session.add(clothing_size)
+                
+                # Add colors
+                for color in category_fields.get("colors", []):
+                    clothing_color = ClothingColor(
+                        clothing_id=product_data["id"],
+                        color=color,
+                    )
+                    session.add(clothing_color)
+            
+            elif category == "books":
+                books = ProductBooks(
+                    product_id=product_data["id"],
+                    isbn=category_fields.get("isbn"),
+                    author=category_fields.get("author"),
+                    page_count=category_fields.get("page_count"),
+                    genre=category_fields.get("genre"),
+                )
+                session.add(books)
+            
+            elif category == "food":
+                food = ProductFood(
+                    product_id=product_data["id"],
+                    weight_g=category_fields.get("weight_g"),
+                    organic=1 if category_fields.get("organic") else 0,
+                    allergens=category_fields.get("allergens"),
+                )
+                session.add(food)
+            
+            elif category == "home":
+                home = ProductHome(
+                    product_id=product_data["id"],
+                    dimensions=category_fields.get("dimensions"),
+                    material=category_fields.get("material"),
+                    assembly_required=1 if category_fields.get("assembly_required") else 0,
+                )
+                session.add(home)
+        
         session.commit()
-        print(f"  Postgres: inserted {inserted_products} products (electronics, clothing, books)")
-
-    # ---- MongoDB ----
-    mongo_db = _mongo_db()
-    catalog = mongo_db["product_catalog"]
-
-    # Ensure unique index on the numeric `id` field
-    catalog.create_index([("id", ASCENDING)], unique=True)
-
-    inserted_mongo = 0
-    for p in products:
-        if catalog.find_one({"id": p["id"]}) is None:
-            catalog.insert_one(dict(p))
-            inserted_mongo += 1
-
-    print(f"  MongoDB:  inserted {inserted_mongo} products into product_catalog")
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: Redis inventory counters
-# ---------------------------------------------------------------------------
-
-def seed_phase2() -> None:
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-    from ecommerce_pipeline.postgres_models import Base, Product
-    from ecommerce_pipeline.db_access import DBAccess
-
-    pg_url = _pg_url()
-    engine = create_engine(pg_url, echo=False)
-    Session = sessionmaker(bind=engine)
-
-    redis_client = _redis_client()
-    mongo_db = _mongo_db()
-
-    db = DBAccess(Session, mongo_db, redis_client=redis_client)
-    db.init_inventory_counters()
-
-    # Count how many keys were set
-    with Session() as session:
-        count = session.query(Product).count()
-    print(f"  Redis: initialized {count} inventory counters (inventory:{{product_id}})")
-
-
-# ---------------------------------------------------------------------------
-# Phase 3: Neo4j recommendation graph
-# ---------------------------------------------------------------------------
-
-def seed_phase3() -> None:
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-    from ecommerce_pipeline.db_access import DBAccess
-
-    pg_url = _pg_url()
-    engine = create_engine(pg_url, echo=False)
-    Session = sessionmaker(bind=engine)
-
-    redis_client = _redis_client()
-    mongo_db = _mongo_db()
-    neo4j_driver = _neo4j_driver()
-
-    db = DBAccess(Session, mongo_db, redis_client=redis_client, neo4j_driver=neo4j_driver)
-
-    orders = load_json("historical_orders.json")
-    # seed_recommendation_graph expects list of {"order_id": int, "product_ids": [int]}
-    graph_orders = [{"order_id": o["order_id"], "product_ids": o["product_ids"]} for o in orders]
-    db.seed_recommendation_graph(graph_orders)
-
-    print(f"  Neo4j: seeded recommendation graph from {len(orders)} historical orders")
-
-    neo4j_driver.close()
-
-
-# ---------------------------------------------------------------------------
-# Connection helpers — read env vars with defaults matching docker-compose
-# ---------------------------------------------------------------------------
-
-def _pg_url() -> str:
-    host = os.environ.get("POSTGRES_HOST", "localhost")
-    port = os.environ.get("POSTGRES_PORT", "5432")
-    db   = os.environ.get("POSTGRES_DB", "ecommerce")
-    user = os.environ.get("POSTGRES_USER", "postgres")
-    pwd  = os.environ.get("POSTGRES_PASSWORD", "postgres")
-    return f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}"
-
-
-def _mongo_db():
-    from pymongo import MongoClient
-    host = os.environ.get("MONGO_HOST", "localhost")
-    port = int(os.environ.get("MONGO_PORT", "27017"))
-    db   = os.environ.get("MONGO_DB", "ecommerce")
-    return MongoClient(host, port)[db]
-
-
-def _redis_client():
-    import redis
-    host = os.environ.get("REDIS_HOST", "localhost")
-    port = int(os.environ.get("REDIS_PORT", "6379"))
-    return redis.Redis(host=host, port=port, decode_responses=True)
-
-
-def _neo4j_driver():
-    from neo4j import GraphDatabase
-    host = os.environ.get("NEO4J_HOST", "localhost")
-    port = os.environ.get("NEO4J_BOLT_PORT", "7687")
-    user = os.environ.get("NEO4J_USER", "neo4j")
-    pwd  = os.environ.get("NEO4J_PASSWORD", "neo4jpassword")
-    return GraphDatabase.driver(f"bolt://{host}:{port}", auth=(user, pwd))
+        
+        # Insert products into MongoDB
+        product_catalog = mongo_db["product_catalog"]
+        for product_data in products:
+            doc = {
+                "id": product_data["id"],
+                "name": product_data["name"],
+                "price": product_data["price"],
+                "stock_quantity": product_data["stock_quantity"],
+                "category": product_data["category"],
+                "description": product_data.get("description"),
+                "category_fields": product_data.get("category_fields", {}),
+            }
+            product_catalog.insert_one(doc)
+        
+        # ── Phase 2: Initialize Redis inventory counters ────────────────────
+        
+        if redis_client:
+            for product_data in products:
+                redis_client.set(f"inventory:{product_data['id']}", str(product_data["stock_quantity"]))
+        
+        # ── Phase 3: Build Neo4j co-purchase graph ─────────────────────────
+        
+        if neo4j_driver:
+            # Create Product nodes in Neo4j
+            with neo4j_driver.session() as neo_session:
+                # Create/update product nodes
+                for product_data in products:
+                    neo_session.run(
+                        """
+                        MERGE (p:Product {id: $product_id})
+                        SET p.name = $name, p.price = $price
+                        """,
+                        product_id=product_data["id"],
+                        name=product_data["name"],
+                        price=product_data["price"],
+                    )
+                
+                # Create BOUGHT_TOGETHER relationships from historical orders
+                for order_data in historical_orders:
+                    product_ids = order_data["product_ids"]
+                    
+                    # For each pair of products in the order, create/update a BOUGHT_TOGETHER edge
+                    for product_a, product_b in combinations(product_ids, 2):
+                        # Ensure consistent direction (lower ID first) to avoid duplicate edges
+                        if product_a > product_b:
+                            product_a, product_b = product_b, product_a
+                        
+                        neo_session.run(
+                            """
+                            MATCH (a:Product {id: $product_a}), (b:Product {id: $product_b})
+                            MERGE (a)-[r:BOUGHT_TOGETHER]->(b)
+                            ON CREATE SET r.count = 1
+                            ON MATCH SET r.count = r.count + 1
+                            """,
+                            product_a=product_a,
+                            product_b=product_b,
+                        )
+    
+    finally:
+        session.close()
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Seed the ecommerce-pipeline databases")
-    parser.add_argument(
-        "--phase",
-        choices=["1", "2", "3", "all"],
-        default="all",
-        help="Which phase to seed (default: all)",
-    )
-    args = parser.parse_args()
+def _pg_url() -> str:
+    host = os.environ.get("POSTGRES_HOST", "localhost")
+    port = os.environ.get("POSTGRES_PORT", "5432")
+    db = os.environ.get("POSTGRES_DB", "ecommerce")
+    user = os.environ.get("POSTGRES_USER", "postgres")
+    pwd = os.environ.get("POSTGRES_PASSWORD", "postgres")
+    return f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}"
 
-    phases = ["1", "2", "3"] if args.phase == "all" else [args.phase]
 
-    for phase in phases:
-        print(f"\nSeeding Phase {phase}...")
-        if phase == "1":
-            seed_phase1()
-        elif phase == "2":
-            seed_phase2()
-        elif phase == "3":
-            seed_phase3()
+def _mongo_db():
+    from pymongo import MongoClient
 
-    print("\nDone.")
+    host = os.environ.get("MONGO_HOST", "localhost")
+    port = int(os.environ.get("MONGO_PORT", "27017"))
+    db = os.environ.get("MONGO_DB", "ecommerce")
+    return MongoClient(host, port)[db]
+
+
+def _redis_client():
+    host = os.environ.get("REDIS_HOST")
+    if not host:
+        return None
+    import redis
+
+    port = int(os.environ.get("REDIS_PORT", "6379"))
+    return redis.Redis(host=host, port=port, decode_responses=True)
+
+
+def _neo4j_driver():
+    host = os.environ.get("NEO4J_HOST")
+    pwd = os.environ.get("NEO4J_PASSWORD")
+    if not host or not pwd:
+        return None
+    from neo4j import GraphDatabase
+
+    port = os.environ.get("NEO4J_BOLT_PORT", "7687")
+    user = os.environ.get("NEO4J_USER", "neo4j")
+    return GraphDatabase.driver(f"bolt://{host}:{port}", auth=(user, pwd))
+
+
+def main():
+    from sqlalchemy import create_engine
+
+    engine = create_engine(_pg_url(), echo=False)
+    mongo_db = _mongo_db()
+    redis_client = _redis_client()
+    neo4j_driver = _neo4j_driver()
+
+    print("Seeding databases...")
+    seed(engine, mongo_db, redis_client, neo4j_driver)
+    print("Seeding complete.")
+
+    if neo4j_driver:
+        neo4j_driver.close()
+    engine.dispose()
 
 
 if __name__ == "__main__":

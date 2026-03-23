@@ -34,6 +34,8 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 seed = "scripts.seed:main"
+migrate = "scripts.migrate:main"
+setup = "scripts.setup:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ecommerce_pipeline"]

@@ -206,7 +206,7 @@ def db_phase1(pg_session_factory, mongo_db):
 @pytest.fixture
 def db_phase2(pg_session_factory, mongo_db, redis_client):
     """Phase 2: Postgres + MongoDB + Redis."""
-    return DBAccess(pg_session_factory, mongo_db, redis_client)
+    return DBAccess(pg_session_factory, mongo_db, redis_client=redis_client)
 
 
 @pytest.fixture

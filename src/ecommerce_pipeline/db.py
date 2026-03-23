@@ -36,16 +36,6 @@ _pg_engine = create_engine(pg_url)
 _pg_session_factory = sessionmaker(bind=_pg_engine)
 
 
-def create_tables() -> None:
-    """Create all Postgres tables if they do not exist.
-
-    Called at startup. Uses the metadata attached to the SQLAlchemy models
-    defined in postgres_models.py.
-    """
-    from ecommerce_pipeline.postgres_models import Base
-    Base.metadata.create_all(_pg_engine)
-
-
 # ── MongoDB ───────────────────────────────────────────────────────────────────
 
 mongo_host = os.environ.get("MONGO_HOST", "localhost")

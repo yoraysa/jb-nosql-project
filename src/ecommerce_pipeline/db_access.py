@@ -1,32 +1,65 @@
 """
 DBAccess — the data access layer.
 
-This is the only file you need to implement. The web API is already wired up;
+This is one of the files you implement. The web API is already wired up;
 every route calls one method on this class. Your job is to replace each
 `raise NotImplementedError(...)` with a real implementation.
 
-Work through the phases in order. Read the corresponding lesson file in
-materials/project/ before starting each phase.
+Work through the phases in order. Read the corresponding lesson file before
+starting each phase.
+
+You also implement scripts/migrate.py and scripts/seed.py alongside this file.
 """
+
+from __future__ import annotations
 
 import json
 import logging
 from itertools import combinations
+from typing import TYPE_CHECKING
+
+from decimal import Decimal
 
 from sqlalchemy import select
+
+from ecommerce_pipeline.models.responses import (
+    OrderCustomerEmbed,
+    OrderItemResponse,
+    OrderResponse,
+    OrderSnapshotResponse,
+    ProductResponse,
+    CategoryRevenueResponse,
+    RecommendationResponse,
+)
+
+if TYPE_CHECKING:
+    import neo4j
+    import redis as redis_lib
+    from pymongo.database import Database as MongoDatabase
+    from sqlalchemy.orm import sessionmaker
+
+    from ecommerce_pipeline.models.requests import OrderItemRequest
+    from ecommerce_pipeline.models.responses import (
+        CategoryRevenueResponse,
+        OrderItemResponse,
+        OrderResponse,
+        OrderSnapshotResponse,
+        ProductResponse,
+        RecommendationResponse,
+    )
 
 logger = logging.getLogger(__name__)
 
 
 class DBAccess:
-
     def __init__(
         self,
-        pg_session_factory,   # sqlalchemy.orm.sessionmaker bound to Postgres engine
-        mongo_db,             # pymongo.database.Database
-        redis_client=None,    # redis.Redis | None  (None until Phase 2)
-        neo4j_driver=None,    # neo4j.Driver | None (None until Phase 3)
+        pg_session_factory: sessionmaker,
+        mongo_db: MongoDatabase,
+        redis_client: redis_lib.Redis | None = None,
+        neo4j_driver: neo4j.Driver | None = None,
         ) -> None:
+
         self._pg_session_factory = pg_session_factory
         self._mongo_db = mongo_db
         self._redis = redis_client
@@ -34,24 +67,20 @@ class DBAccess:
 
     # ── Phase 1 ───────────────────────────────────────────────────────────────
 
-    def create_order(self, customer_id: int, items: list[dict]) -> dict:
+    def create_order(self, customer_id: int, items: list[OrderItemRequest]) -> OrderResponse:
         """Place an order atomically.
 
-        customer_id: int
-        items: [{"product_id": int, "quantity": int}, ...]
+        See OrderItemRequest in models/requests.py for the input shape.
+        See OrderResponse in models/responses.py for the return shape.
 
-        Returns a dict with order_id, customer_id, status, total_amount,
-        created_at (ISO 8601 string), and a list of items including product_name
-        and unit_price.
-
-        Raises ValueError if any product has insufficient stock or customer fields are invalid.
-        When that happens, no data is modified in any database.
+        Raises ValueError if any product has insufficient stock. When that
+        happens, no data is modified in any database.
 
         After the order is persisted transactionally, a denormalized snapshot
         is saved for read access, and downstream counters and graph edges are
         updated (best-effort, does not roll back the order on failure).
         """
-        
+
         try:
             customer_id = int(customer_id)
         except (TypeError, ValueError) as exc:
@@ -69,11 +98,24 @@ class DBAccess:
         # - Aggregate quantities per product so we can validate stock once per product
         qty_by_product_id: dict[int, int] = {}
         for item in items:
-            product_id = int(item["product_id"])
-            quantity = int(item["quantity"])
+            product_id = int(item.product_id)
+            quantity = int(item.quantity)
             if quantity <= 0:
                 raise ValueError("quantity must be greater than 0")
             qty_by_product_id[product_id] = qty_by_product_id.get(product_id, 0) + quantity
+
+        # Fast pre-check: if Redis inventory counters are populated, check them
+        # before starting a heavy Postgres transaction.
+        try:
+            if self._redis:
+                for product_id, needed_qty in qty_by_product_id.items():
+                    val = self._redis.get(f"inventory:{product_id}")
+                    if val is not None and int(val) < needed_qty:
+                        raise ValueError("Insufficient stock")
+        except ValueError:
+            raise
+        except Exception:
+            logger.warning("Fast inventory check failed (best-effort)")
 
         # We only need to load/lock products referenced by the order.
         product_ids = list(qty_by_product_id.keys())
@@ -121,11 +163,11 @@ class DBAccess:
                     # - `items_list`: returned to the caller + MongoDB snapshot (denormalized)
                     total_amount = 0.0
                     order_items: list[OrderItem] = []
-                    items_list: list[dict] = []
+                    items_list: list[OrderItemResponse] = []
 
                     for item in items:
-                        pid = int(item["product_id"])
-                        qty = int(item["quantity"])
+                        pid = int(item.product_id)
+                        qty = int(item.quantity)
                         product = product_by_id[pid]
                         unit_price = float(product.price)
                         total_amount += unit_price * qty
@@ -138,12 +180,12 @@ class DBAccess:
                             )
                         )
                         items_list.append(
-                            {
-                                "product_id": pid,
-                                "product_name": product.name,
-                                "quantity": qty,
-                                "unit_price": unit_price,
-                            }
+                            OrderItemResponse(
+                                product_id=pid,
+                                product_name=product.name,
+                                quantity=qty,
+                                unit_price=unit_price,
+                            )
                         )
 
 
@@ -173,14 +215,14 @@ class DBAccess:
                     if hasattr(order.created_at, "isoformat")
                     else str(order.created_at)
                 )
-                result = {
-                    "order_id": int(order.id),
-                    "customer_id": int(order.customer_id),
-                    "status": str(order.status),
-                    "total_amount": float(order.total_amount),
-                    "created_at": created_at,
-                    "items": items_list,
-                }
+                result = OrderResponse(
+                    order_id=int(order.id),
+                    customer_id=int(order.customer_id),
+                    status=str(order.status),
+                    total_amount=float(order.total_amount),
+                    created_at=created_at,
+                    items=items_list,
+                )
             except Exception:
                 # Defensive rollback: `session.begin()` will roll back on exceptions,
                 # but we also explicitly rollback to keep session state clean.
@@ -190,32 +232,36 @@ class DBAccess:
         # Best-effort: denormalized snapshot in MongoDB for fast reads
         # This happens after the transactional Postgres commit and does not affect
         # the order outcome if it fails.
-        try:
-            self.save_order_snapshot(
-                result["order_id"],
-                result["customer_id"],
-                result["items"],
-                result["total_amount"],
-                result["status"],
-                result["created_at"],
-            )
-        except Exception:
-            logger.exception("Failed to write order snapshot (best-effort)")
-            return None
+        self.save_order_snapshot(
+            result.order_id,
+            self.get_customer_embed(customer_id),
+            result.items,
+            result.total_amount,
+            result.status,
+            result.created_at,
+        )
 
         # Best-effort: invalidate product cache for all products in the order
         # so that the next read fetches fresh stock quantities from Postgres.
         try:
             for item in items:
-                product_id = int(item["product_id"])
+                product_id = int(item.product_id)
                 self.invalidate_product_cache(product_id)
         except Exception:
             logger.exception("Failed to invalidate product cache (best-effort)")
 
+        # Best-effort: decrement Redis inventory counters
+        try:
+            if self._redis:
+                for product_id, needed_qty in qty_by_product_id.items():
+                    self._redis.decrby(f"inventory:{product_id}", needed_qty)
+        except Exception:
+            logger.exception("Failed to decrement Redis inventory counters (best-effort)")
+
         # Best-effort: update the co-purchase recommendation graph in Neo4j
         # with the products from this new order.
         try:
-            product_ids = [int(item["product_id"]) for item in items]
+            product_ids = [int(item.product_id) for item in items]
             self.seed_recommendation_graph(
                 [{"order_id": int(order.id), "product_ids": product_ids}]
             )
@@ -224,19 +270,38 @@ class DBAccess:
 
         return result
 
+    def get_customer_embed(self, customer_id: int) -> OrderCustomerEmbed:
+        """Fetch a customer and return their embedded representation.
+        
+        Returns an OrderCustomerEmbed with id, name, and email.
+        Raises ValueError if the customer is not found.
+        """
+        from ecommerce_pipeline.postgres_models import Customer
+
+        with self._pg_session_factory() as session:
+            customer = session.get(Customer, customer_id)
+            if customer is None:
+                raise ValueError(f"Customer {customer_id} not found")
+            
+            return OrderCustomerEmbed(
+                id=customer.id,
+                name=customer.name,
+                email=customer.email,
+            )
+
     def save_order_snapshot(
         self,
         order_id: int,
-        customer_id: int,
-        items: list[dict],
+        customer: OrderCustomerEmbed,
+        items: list[OrderItemResponse],
         total_amount: float,
         status: str,
         created_at: str,
-        ) -> str | None:
+    ) -> str:
         """Save a denormalized order snapshot for fast read access.
 
-        customer: {"id": int, "name": str, "email": str}
-        items: [{"product_id": int, "product_name": str, "quantity": int, "unit_price": float}]
+        See OrderCustomerEmbed and OrderItemResponse in models/responses.py
+        for the input shapes.
 
         Embeds all customer and product details as they existed at the time
         of the order, so the snapshot remains accurate even if prices or
@@ -248,40 +313,73 @@ class DBAccess:
         commits. Not called directly by routes.
         """
 
-        result = self._mongo_db["order_snapshots"].insert_one(
-            {
-                "order_id": order_id,
-                "customer_id": customer_id,
-                "items": items,
-                "total_amount": total_amount,
-                "status": status,
-                "created_at": created_at,
-            }
-        )
+        try:
+            # Pymongo cannot serialize Pydantic models directly; convert to dicts.
+            items_dicts = [
+                item.model_dump() if hasattr(item, "model_dump") else item
+                for item in items
+            ]
+            result = self._mongo_db["order_snapshots"].insert_one(
+                {
+                    "order_id": order_id,
+                    "customer": customer.model_dump(),
+                    "items": items_dicts,
+                    "total_amount": total_amount,
+                    "status": status,
+                    "created_at": created_at,
+                }
+            )
+            return str(result.inserted_id)
+        except Exception:
+            logger.exception("Failed to write order snapshot (best-effort)")
+            return ""
 
-        return str(result.inserted_id)
-
-    def get_product(self, product_id: int) -> dict | None:
+    def get_product(self, product_id: int) -> ProductResponse | None:
         """Fetch a product by its integer ID.
 
-        Returns a dict with id, name, price, stock_quantity, category,
-        description, and category_fields. Returns None if not found.
+        See ProductResponse in models/responses.py for the return shape.
+        Returns None if not found.
 
-        The category_fields shape varies by category:
-          electronics: {cpu, ram_gb, storage_gb, screen_inches}
-          clothing:    {material, sizes, colors}
-          books:       {isbn, author, page_count, genre}
-          food:        {weight_g, organic, allergens}
-          home:        {dimensions, material, assembly_required}
+        main logic:
+        search product in redis (if found, return it)
+            if product not found in redis, search in mongo (if found, write to redis)
+                if not found in mongo, search in postgres (if found, write to redis+mongo)
+                    if not found in postgres return None
         """
 
-        # Cache-aside pattern: check Redis first
-        cached = self._redis.get(f"product:{product_id}")
-        if cached:
-            print("Cache hit for product", product_id)
-            return json.loads(cached)
+        def write_to_redis(product_id, result):
+            try:
+                self._redis.set(f"product:{product_id}", result.model_dump_json(), ex=300)
+                print("Redis cache write for product", product_id)
+            except Exception as e:
+                logger.exception("Failed to cache product (best-effort)")
 
-        # Cache miss: fetch from Postgres
+
+        # Cache-aside pattern: first, check Redis
+        try:
+            cached = self._redis.get(f"product:{product_id}")
+            if cached:
+                print("Redis cache hit for product", product_id)
+                return ProductResponse(**json.loads(cached))
+        except Exception as e:
+            logger.exception("Failed to get product from cache (best-effort)")
+
+        # Second, check MongoDB
+        try:
+            product_doc = self._mongo_db["product_catalog"].find_one({"id": product_id})
+            if product_doc:
+                product_doc.pop('_id', None)
+                result = ProductResponse(**product_doc)
+                
+                # Cache it in Redis if possible
+                write_to_redis(product_id, result)
+
+                print("MongoDB cache hit for product", product_id)
+                return result
+        except Exception as e:
+            logger.exception("Failed to get product from MongoDB (best-effort)")
+
+        # Third, fetch from Postgres (cache miss)
         print("Cache miss for product", product_id)
         from ecommerce_pipeline.postgres_models import Product
         from sqlalchemy.inspection import inspect
@@ -289,6 +387,7 @@ class DBAccess:
         with self._pg_session_factory() as session:
             product = session.get(Product, product_id)
             if product is None:
+                print("product not found in postgres")
                 return None
 
             # Build category_fields dict dynamically based on category-specific relationships
@@ -302,6 +401,8 @@ class DBAccess:
                     # Skip the foreign key column (product_id)
                     if column.name != 'product_id':
                         value = getattr(category_model, column.name)
+                        if isinstance(value, Decimal):
+                            value = float(value)
                         category_fields[column.name] = value
 
             # Handle special cases for relationships (sizes, colors for clothing)
@@ -310,31 +411,31 @@ class DBAccess:
                 category_fields['colors'] = [color.color for color in product.clothing.colors]
 
             # Build the response dict matching the expected schema
-            result = {
-                "id": product.id,
-                "name": product.name,
-                "price": float(product.price),
-                "stock_quantity": product.stock_quantity,
-                "category": product.category,
-                "description": product.description or "",
-                "category_fields": category_fields,
-            }
+            result = ProductResponse(
+                id=product.id,
+                name=product.name,
+                price=float(product.price),
+                stock_quantity=product.stock_quantity,
+                category=product.category,
+                description=product.description or "",
+                category_fields=category_fields,
+            )
 
         # Populate the cache for next time
-        try:
-            self._redis.set(f"product:{product_id}", json.dumps(result, default=str))
+        write_to_redis(product_id, result)
 
-            print("Cached product", product_id)
-        except Exception:
-            logger.exception("Failed to cache product (best-effort)")
+        # Save to MongoDB for next time
+        try:
+            self._mongo_db["product_catalog"].replace_one(
+                {"id": product_id}, result.model_dump(), upsert=True
+            )
+            print("MongoDB write for product", product_id)
+        except Exception as e:
+            logger.exception("Failed to sync product to MongoDB (best-effort)")
 
         return result
 
-    def search_products(
-        self,
-        category: str | None = None,
-        q: str | None = None,
-        ) -> list[dict]:
+    def search_products(self, category: str | None = None, q: str | None = None) -> list[ProductResponse]:
 
         """Search the product catalog with optional filters.
 
@@ -351,40 +452,91 @@ class DBAccess:
             query["name"] = {"$regex": q, "$options": "i"}
 
         products = list(self._mongo_db["product_catalog"].find(query))
-        for product in products:
-            product.pop('_id', None)
-        return products
+        return [ProductResponse(**p) for p in products]
 
-    def get_order(self, order_id: int) -> dict | None:
+    def get_order(self, order_id: int) -> OrderSnapshotResponse | None:
         """Fetch a single order snapshot by order_id.
 
-        Returns the snapshot dict (order_id, customer_id, items list,
-        total_amount, status, created_at) or None if not found.
+        See OrderSnapshotResponse in models/responses.py for the return shape.
+        Returns None if not found.
         """
 
         order_doc = self._mongo_db["order_snapshots"].find_one({"order_id": order_id})
-        if order_doc is None:
-            return None
-        # Remove MongoDB's _id field
-        order_doc.pop('_id', None)
-        return order_doc
+        if order_doc:
+            order_doc.pop('_id', None)
+            return OrderSnapshotResponse(**order_doc)
 
-    def get_order_history(self, customer_id: int) -> list[dict]:
-        """Fetch all order snapshots for a customer.
+        # If not in Mongo, check Postgres
+        from ecommerce_pipeline.postgres_models import Order, OrderItem
+        from sqlalchemy.orm import joinedload
 
-        Returns a list of snapshot dicts sorted by created_at descending.
+        with self._pg_session_factory() as session:
+            # Query order with customer and items/products
+            order = session.get(Order, order_id, options=[
+                joinedload(Order.customer),
+                joinedload(Order.items).joinedload(OrderItem.product)
+            ])
+
+            if order is None:
+                return None
+
+            # Construct the response matching OrderSnapshotResponse shape
+            customer_embed = OrderCustomerEmbed(
+                id=order.customer.id,
+                name=order.customer.name,
+                email=order.customer.email
+            )
+
+            items_list = []
+            for item in order.items:
+                items_list.append(OrderItemResponse(
+                    product_id=item.product_id,
+                    product_name=item.product.name,
+                    quantity=item.quantity,
+                    unit_price=float(item.unit_price)
+                ))
+
+            created_at = (
+                order.created_at.isoformat()
+                if hasattr(order.created_at, "isoformat")
+                else str(order.created_at)
+            )
+
+            result = OrderSnapshotResponse(
+                order_id=int(order.id),
+                customer=customer_embed,
+                items=items_list,
+                total_amount=float(order.total_amount),
+                status=str(order.status),
+                created_at=created_at,
+            )
+
+            # Set in MongoDB (save snapshot)
+            self.save_order_snapshot(
+                result.order_id,
+                customer_embed,
+                result.items,
+                result.total_amount,
+                result.status,
+                result.created_at,
+            )
+
+            print("result", result)
+            return result
+
+    def get_order_history(self, customer_id: int) -> list[OrderSnapshotResponse]:
+        """Fetch all order snapshots for a customer, sorted by created_at descending.
+
         Returns an empty list if the customer has no orders.
         """
         order_docs = list(
             self._mongo_db["order_snapshots"]
-            .find({"customer_id": customer_id})
+            .find({"customer.id": customer_id})
             .sort("created_at", -1)
         )
-        for order_doc in order_docs:
-            order_doc.pop('_id', None)
-        return order_docs
+        return [OrderSnapshotResponse(**doc) for doc in order_docs]
 
-    def revenue_by_category(self) -> list[dict]:
+    def revenue_by_category(self, category: str | None = None) -> list[CategoryRevenueResponse]:
         """Compute total revenue per product category.
 
         Returns [{"category": str, "total_revenue": float}, ...] sorted by
@@ -404,35 +556,31 @@ class DBAccess:
                 .order_by(func.sum(OrderItem.quantity * OrderItem.unit_price).desc())
             )
             
+            if category is not None:
+                query = query.where(Product.category == category)
+            
             results = session.execute(query).all()
             return [
-                {
-                    "category": row[0],
-                    "total_revenue": float(row[1]) if row[1] is not None else 0.0
-                }
+                CategoryRevenueResponse(
+                    category=row[0],
+                    total_revenue=float(row[1]) if row[1] is not None else 0.0
+                )
                 for row in results
             ]
 
 
     # ── Phase 2 ───────────────────────────────────────────────────────────────
+    #
+    # In this phase you also need to:
+    #   - Update create_order to DECR Redis inventory counters after the
+    #     Postgres transaction succeeds.
+    #   - Optionally, add a fast pre-check: before starting the Postgres
+    #     transaction, check the Redis counter. If it shows insufficient
+    #     stock, fail fast without hitting Postgres.
+    #   - Update scripts/seed.py to initialize inventory counters in Redis.
+    #   - Add cache-aside logic to get_product (check Redis first, populate
+    #     on miss with a 300-second TTL).
 
-    def init_inventory_counters(self) -> None:
-        """Seed inventory counters from current stock quantities.
-
-        For each product, write its current stock_quantity to the counter
-        store. Called at startup and after seeding products.
-        """
-
-        from ecommerce_pipeline.postgres_models import Product
-
-        with self._pg_session_factory() as session:
-            # Query all products from Postgres
-            query = select(Product)
-            products = session.execute(query).scalars().all()
-
-            # For each product, set its stock quantity in Redis
-            for product in products:
-                self._redis.set(f"inventory:{product.id}", product.stock_quantity)
 
     def invalidate_product_cache(self, product_id: int) -> None:
         """Remove a product's cached entry.
@@ -450,8 +598,8 @@ class DBAccess:
 
         Redis delete() method is safe to call on non-existent keys, so it's automatically a no-op if the cache entry doesn't exist.
         """
-
-        self._redis.delete(f"product:{product_id}")
+        if self._redis:
+            self._redis.delete(f"product:{product_id}")
 
     def record_product_view(self, customer_id: int, product_id: int) -> None:
         """Record that a customer viewed a product.
@@ -479,6 +627,13 @@ class DBAccess:
         return [int(view) for view in views]
 
     # ── Phase 3 ───────────────────────────────────────────────────────────────
+    #
+    # In this phase you also need to:
+    #   - Update create_order to MERGE co-purchase edges in Neo4j for every
+    #     pair of products in the order, incrementing the edge weight.
+    #   - Update scripts/migrate.py to create Neo4j constraints.
+    #   - Update scripts/seed.py to build the co-purchase graph from
+    #     seed_data/historical_orders.json.
 
     def seed_recommendation_graph(self, orders: list[dict]) -> None:
         """Build the co-purchase recommendation graph from order history.
@@ -517,7 +672,7 @@ class DBAccess:
                     """
                     session.run(query, pid1=product_id_1, pid2=product_id_2)
 
-    def get_recommendations(self, product_id: int, limit: int = 5) -> list[dict]:
+    def get_recommendations(self, product_id: int, limit: int = 5) -> list[RecommendationResponse]:
         """Return product recommendations based on co-purchase patterns.
 
         Returns [{"product_id": int, "name": str, "score": int}, ...]
@@ -551,10 +706,10 @@ class DBAccess:
                 # Fetch product name from Postgres
                 product = self.get_product(recommended_product_id)
                 if product:
-                    recommendations.append({
-                        "product_id": recommended_product_id,
-                        "name": product.get("name", ""),
-                        "score": int(score) if score else 0,
-                    })
+                    recommendations.append(RecommendationResponse(
+                        product_id=recommended_product_id,
+                        name=product.name,
+                        score=int(score) if score else 0,
+                    ))
 
         return recommendations
