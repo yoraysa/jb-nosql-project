@@ -204,8 +204,8 @@ def seed(engine, mongo_db, redis_client=None, neo4j_driver=None):
                             """
                             MATCH (a:Product {id: $product_a}), (b:Product {id: $product_b})
                             MERGE (a)-[r:BOUGHT_TOGETHER]->(b)
-                            ON CREATE SET r.count = 1
-                            ON MATCH SET r.count = r.count + 1
+                            ON CREATE SET r.purchases = 1
+                            ON MATCH SET r.purchases = r.purchases + 1
                             """,
                             product_a=product_a,
                             product_b=product_b,

@@ -20,7 +20,7 @@ from ecommerce_pipeline.models.responses import RecommendationResponse
 # ---------------------------------------------------------------------------
 
 def test_get_recommendations_shape(db, seeded):
-    """get_recommendations returns a list of RecommendationResponse with product_id, name, and score."""
+    """get_recommendations returns a list of RecommendationResponse with product_id, name, and purchases."""
     result = db.get_recommendations(1)
 
     assert isinstance(result, list)
@@ -29,16 +29,16 @@ def test_get_recommendations_shape(db, seeded):
         assert isinstance(item, RecommendationResponse)
         assert isinstance(item.product_id, int)
         assert isinstance(item.name, str)
-        assert isinstance(item.score, int)
+        assert isinstance(item.purchases, int)
 
 
 def test_get_recommendations_sorted(db, seeded):
-    """Recommendations are returned in descending order of score."""
+    """Recommendations are returned in descending order of purchases."""
     result = db.get_recommendations(1)
 
     assert len(result) >= 2
-    scores = [item.score for item in result]
-    assert scores == sorted(scores, reverse=True)
+    purchasess = [item.purchases for item in result]
+    assert purchasess == sorted(purchasess, reverse=True)
 
 
 def test_get_recommendations_excludes_self(db, seeded):

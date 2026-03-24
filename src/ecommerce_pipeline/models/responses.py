@@ -63,7 +63,7 @@ class OrderHistoryResponse(BaseModel):
 class RecommendationResponse(BaseModel):
     product_id: int
     name: str
-    score: int  # co-purchase strength; higher means more frequently bought together
+    purchases: int  # co-purchase strength; higher means more frequently bought together
 
 
 class RecommendationListResponse(BaseModel):
